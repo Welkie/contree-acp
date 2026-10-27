@@ -1,0 +1,30 @@
+{
+  "R_w": {
+    "mean_diff": -0.13349242430296032,
+    "median_diff": -0.003721610055638605,
+    "lower": 11,
+    "higher": 0,
+    "wilcoxon_p": 0.0009765625
+  },
+  "path redundancy": {
+    "mean_diff": -0.1264361640669792,
+    "median_diff": -0.01899985462518728,
+    "lower": 11,
+    "higher": 1,
+    "wilcoxon_p": 0.0009765625
+  },
+  "test accuracy": {
+    "mean_diff": -0.0011258274206414065,
+    "median_diff": -0.00014945970722968216,
+    "lower": 9,
+    "higher": 3,
+    "wilcoxon_p": 0.0771484375
+  },
+  "features used": {
+    "mean_diff": -0.4549999999999999,
+    "median_diff": -0.040000000000000036,
+    "lower": 9,
+    "higher": 0,
+    "wilcoxon_p": 0.00390625
+  }
+}

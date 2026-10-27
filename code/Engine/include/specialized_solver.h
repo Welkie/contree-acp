@@ -1,0 +1,58 @@
+#ifndef SPECIALIZED_SOLVER_H
+#define SPECIALIZED_SOLVER_H
+
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <queue>
+
+#include "configuration.h"
+#include "dataset.h"
+#include "dataview.h"
+#include "intervals_pruner.h"
+#include "statistics.h"
+#include "tree.h"
+
+
+class Depth1ScoreHelper;
+
+struct SplitInfo;
+
+class SpecializedSolver {
+public:
+    /**
+     * Calculates the misclassification scores for both the left and right splits of the dataset using only one dataset traversal.
+     * 
+     * @param dataset The dataset to calculate the scores from.
+     * @param split Information on the root node split, such as what feature to split on
+     * @param upper_bound The upper bound for the scores.
+     * @param complexity_cost The cost of adding a node
+     * @param child_penalty_factors ACP factor P(g, A + {root feature}) of every feature g for the depth-one splits (empty without ACP)
+     */
+    static void get_best_left_right_scores(const Dataview& dataset, SplitInfo& split, float complexity_cost, const std::vector<double>& child_penalty_factors);
+
+private:
+    /**
+    * Calculates the best depth one split for both the left and right splits for a feature to split on
+    *
+    * @param dataset The dataset to calculate the scores from.
+    * @param feature_index The index of the feature (f1) to split on.
+    * @param split_point The split point for the feature (f1).
+    * @param current_feature_index The index of the second feature (f2) to split on
+    * @param split_index The index of the split point (f1)
+    * @param left_tree the depth one score helper for the left subtree
+    * @param right_tree the depth one score helper for the right subtree
+    * @param split_feature_split_indices A mapping from datapoint_indices to unique value indices
+    * @param upper_bound The upper bound for the scores.
+    * @param complexity_cost The cost of adding a node
+    * @param use_acp Whether the ACP penalty is on
+    * @param penalty_factor ACP factor of the second feature (f2) below the first feature (1 without ACP)
+    */
+    template <bool is_same_feature>
+    static void process_depth_one_feature(const Dataview& dataview,
+        const int feature_index, const int split_point, const int current_feature_index, const int split_index,
+        Depth1ScoreHelper& left_tree, Depth1ScoreHelper& right_tree,
+        const std::vector<int>& split_feature_split_indices, const float complexity_cost, const bool use_acp, const double penalty_factor);
+};
+
+#endif // SPECIALIZED_SOLVER_H

@@ -1,0 +1,257 @@
+#include "specialized_solver.h"
+#include "general_solver.h"
+
+class Depth1ScoreHelper {
+public:
+    Depth1ScoreHelper(const int size, const int CLASS_NUMBER)
+        : label_frequency(std::vector<int>(CLASS_NUMBER, 0)), current_label_frequency(std::vector<int>(CLASS_NUMBER, 0)), size(size) {
+
+    }
+
+    void reset_label_frequency() {
+        std::fill(current_label_frequency.begin(), current_label_frequency.end(), 0);
+        previous_value = 0.0f;
+        previous_unique_value_index = -1;
+        is_zero = false;
+        can_skip = 0;
+        current_element_count = 0;
+    }
+
+    bool is_leaf() const { return best_feature_index == -1; }
+
+    // ACP: set the penalty of the feature about to be scanned. A stump with c correct samples then costs
+    // penalty_factor * (complexity cost + size - c) + penalty_offset, and score_to_beat is the largest c that does not improve.
+    void set_feature_penalty(bool use_acp, double factor, float complexity_cost) {
+        penalty_factor = factor;
+        penalty_offset = (1.0 - factor) * leaf_misclassifications;
+        if (!use_acp) {
+            score_to_beat = classification_score;
+        } else if (factor <= ACP_MIN_FACTOR) {
+            is_zero = true; // this feature can never beat the leaf
+        } else {
+            // rounded down with a margin, so rounding errors can only make the skipping more conservative
+            const double threshold = size + complexity_cost - (best_objective - EPSILON - penalty_offset) / factor;
+            score_to_beat = int(std::floor(threshold - 1e-6));
+        }
+    }
+
+    // Objective of the best depth-one tree so far (the leaf, or the best stump)
+    double best_objective = 0.0;
+    double best_penalty_factor = 1.0;
+    double best_penalty_offset = 0.0;
+    int leaf_misclassifications = 0;
+
+    double penalty_factor = 1.0;
+    double penalty_offset = 0.0;
+    int score_to_beat = -1;
+
+    int classification_score = -1;
+    int best_feature_index = -1;
+    float best_threshold = -1.0f;
+    int best_left_label = -1;
+    int best_right_label = -1;
+    int best_left_score = -1;
+    int best_right_score = -1;
+
+    float previous_value = 0.0f;
+    int previous_unique_value_index = -1;
+    bool is_zero = false;
+
+    int can_skip = 0;
+    int current_element_count = 0;
+
+    const int size;
+    int max_label_frequency{ 0 };
+    int max_label{ 0 };
+
+    std::vector<int> label_frequency;
+    std::vector<int> current_label_frequency;
+};
+
+void SpecializedSolver::get_best_left_right_scores(const Dataview& dataview, SplitInfo& split, float complexity_cost, const std::vector<double>& child_penalty_factors) {
+    const bool use_acp = !child_penalty_factors.empty();
+    RUNTIME_ASSERT(dataview.get_dataset_size() > 0, "Dataset cannot be empty.");
+    RUNTIME_ASSERT(split.left_optimal_dt->objective >= 0, "Current objective should always be zero or higher.");
+    RUNTIME_ASSERT(split.right_optimal_dt->objective >= 0, "Current objective should always be zero or higher.");
+    
+    const auto& split_feature = dataview.get_sorted_dataset_feature(split.feature);
+    const auto& unsorted_split_feature = dataview.get_unsorted_dataset_feature(split.feature);
+    std::vector<int> split_feature_split_indices(unsorted_split_feature.size());
+    int split_index = -1;
+    for (const auto& split_feature_data : split_feature) {
+        split_feature_split_indices[split_feature_data.data_point_index] = split_feature_data.unique_value_index;
+        if (split_index == -1 && split_feature_data.unique_value_index >= split.unique_value_threshold) {
+            split_index = split_feature_data.unique_value_index;
+        }
+    }
+    RUNTIME_ASSERT(split_index != -1, "Split index not found.");
+
+    const int dataset_size = dataview.get_dataset_size();
+    const int class_number = dataview.get_class_number();
+
+    RUNTIME_ASSERT(split.split_point > 0 && split.split_point < dataset_size, "left and right subtree need to be non-empty.");
+    Depth1ScoreHelper left_tree(split.split_point, class_number);
+    Depth1ScoreHelper right_tree(dataset_size - split.split_point, class_number);
+    
+
+    left_tree.classification_score  = 0;
+    right_tree.classification_score = 0;
+
+    Dataview::initialize_split_parameters(split_feature, class_number, dataview.get_label_frequency(), split.split_point, left_tree.label_frequency, right_tree.label_frequency);
+
+    left_tree.max_label_frequency = 0;
+    right_tree.max_label_frequency = 0;
+    for (int label = 0; label < class_number; label++) {
+        if (left_tree.label_frequency[label] > left_tree.max_label_frequency) {
+            left_tree.max_label_frequency = left_tree.label_frequency[label];
+            left_tree.max_label = label;
+        }
+        if (right_tree.label_frequency[label] > right_tree.max_label_frequency) {
+            right_tree.max_label_frequency = right_tree.label_frequency[label];
+            right_tree.max_label = label;
+        }
+    }
+    left_tree.classification_score = std::max(left_tree.classification_score, left_tree.max_label_frequency);
+    right_tree.classification_score = std::max(right_tree.classification_score, right_tree.max_label_frequency);
+    left_tree.leaf_misclassifications = left_tree.size - left_tree.classification_score;
+    right_tree.leaf_misclassifications = right_tree.size - right_tree.classification_score;
+    left_tree.best_objective = left_tree.leaf_misclassifications;
+    right_tree.best_objective = right_tree.leaf_misclassifications;
+
+    for (int current_feature_index = 0; current_feature_index < dataview.get_feature_number(); current_feature_index++) {
+        // Stop when neither subtree can improve: both perfect (without ACP), or both at zero cost (with ACP a perfect stump can still cost something)
+        if (!use_acp && left_tree.classification_score + right_tree.classification_score == dataset_size) break;
+        if (use_acp && left_tree.best_objective <= EPSILON && right_tree.best_objective <= EPSILON) break;
+        const double penalty_factor = use_acp ? child_penalty_factors[current_feature_index] : 1.0;
+        if (current_feature_index == split.feature) {
+            process_depth_one_feature<true>(dataview, split.feature, split.split_point, current_feature_index, split_index,
+                left_tree, right_tree, split_feature_split_indices, complexity_cost, use_acp, penalty_factor);
+        } else {
+            process_depth_one_feature<false>(dataview, split.feature, split.split_point, current_feature_index, split_index,
+                left_tree, right_tree, split_feature_split_indices, complexity_cost, use_acp, penalty_factor);
+        }
+    }
+
+    if (left_tree.is_leaf()) {
+        split.left_optimal_dt->make_leaf(left_tree.max_label, left_tree.size - left_tree.classification_score);
+    } else {
+        split.left_optimal_dt->update_split(left_tree.best_feature_index, left_tree.best_threshold,
+            std::make_shared<Tree>(left_tree.best_left_label, left_tree.best_left_score),
+            std::make_shared<Tree>(left_tree.best_right_label, left_tree.best_right_score), complexity_cost,
+            left_tree.best_penalty_factor, left_tree.best_penalty_offset);
+        split.left_optimal_dt->objective = left_tree.best_objective;
+    }
+    RUNTIME_ASSERT(split.left_optimal_dt->objective >= 0, "LR - Left tree misclassification score should be non-negative.");
+
+    if (right_tree.is_leaf()) {
+        split.right_optimal_dt->make_leaf(right_tree.max_label, right_tree.size - right_tree.classification_score);
+    } else {
+        split.right_optimal_dt->update_split(right_tree.best_feature_index, right_tree.best_threshold,
+            std::make_shared<Tree>(right_tree.best_left_label, right_tree.best_left_score),
+            std::make_shared<Tree>(right_tree.best_right_label, right_tree.best_right_score), complexity_cost,
+            right_tree.best_penalty_factor, right_tree.best_penalty_offset);
+        split.right_optimal_dt->objective = right_tree.best_objective;
+    }
+    RUNTIME_ASSERT(split.right_optimal_dt->objective >= 0, "LR - Right tree misclassification score should be non-negative.");
+    split.left_optimal_dt->finalize_lower_bound(std::numeric_limits<float>::max());
+    split.right_optimal_dt->finalize_lower_bound(std::numeric_limits<float>::max());
+}
+
+template <bool is_same_feature>
+void SpecializedSolver::process_depth_one_feature(const Dataview& dataview,
+    const int feature_index, const int split_point, const int current_feature_index, const int split_index,
+    Depth1ScoreHelper& left_tree, Depth1ScoreHelper& right_tree,
+    const std::vector<int>& split_feature_split_indices, const float complexity_cost, const bool use_acp, const double penalty_factor) {
+    const std::vector<Dataset::FeatureElement>& current_feature = dataview.get_sorted_dataset_feature(current_feature_index);
+    const int class_number = dataview.get_class_number();
+    const int dataset_size = dataview.get_dataset_size();
+    const int min_leaf_size = static_cast<int>(std::ceil(complexity_cost));
+    left_tree.reset_label_frequency();
+    right_tree.reset_label_frequency();
+    left_tree.can_skip = min_leaf_size;
+    right_tree.can_skip = min_leaf_size;
+    left_tree.set_feature_penalty(use_acp, penalty_factor, complexity_cost);
+    right_tree.set_feature_penalty(use_acp, penalty_factor, complexity_cost);
+
+    Depth1ScoreHelper* tree_p = &left_tree;
+    int index = 0;
+    for (const auto& current_feature_data : current_feature) {
+        if constexpr (!is_same_feature) {
+            int cur_split_index = split_feature_split_indices[current_feature_data.data_point_index];
+            bool is_left_tree = (cur_split_index < split_index);
+            tree_p = is_left_tree ? &left_tree : &right_tree;
+        } else {
+            if (index++ == split_point) {
+                tree_p = &right_tree;
+            };
+        }
+        auto& tree = *tree_p;
+
+        if (tree.is_zero) {
+            continue;
+        }
+
+        tree.can_skip--;
+
+        if (current_feature_data.unique_value_index == tree.previous_unique_value_index || tree.can_skip > 0) {
+            tree.current_element_count++;
+            tree.current_label_frequency[current_feature_data.label]++;
+            tree.previous_value = current_feature_data.value;
+            tree.previous_unique_value_index = current_feature_data.unique_value_index;
+            RUNTIME_ASSERT(tree.current_label_frequency[current_feature_data.label] <= tree.label_frequency[current_feature_data.label]
+                , "Current label frequency can never exceed the maximum label frequency.");
+            continue;
+        }
+
+        int left_classification_score = -1;
+        int right_classification_score = -1;
+
+        int left_label = -1;
+        int right_label = -1;
+
+        for (int label_value = 0; label_value < class_number; label_value++) {
+            if (tree.current_label_frequency[label_value] > left_classification_score) {
+                left_classification_score = tree.current_label_frequency[label_value];
+                left_label = label_value;
+            }
+            if (tree.label_frequency[label_value] - tree.current_label_frequency[label_value] > right_classification_score) {
+                right_classification_score = tree.label_frequency[label_value] - tree.current_label_frequency[label_value];
+                right_label = label_value;
+            }
+        }
+
+        const double objective = tree.penalty_factor * (complexity_cost + (tree.size - left_classification_score - right_classification_score)) + tree.penalty_offset;
+        if (objective < tree.best_objective - EPSILON) {
+            RUNTIME_ASSERT(tree.classification_score <= tree.size, "LR - Classification score cannot exceed the number of instances.");
+            tree.classification_score = left_classification_score + right_classification_score;
+            tree.score_to_beat = tree.classification_score;
+            tree.best_objective = objective;
+            tree.best_penalty_factor = tree.penalty_factor;
+            tree.best_penalty_offset = tree.penalty_offset;
+            tree.best_feature_index = current_feature_index;
+            tree.best_threshold = (current_feature_data.value + tree.previous_value) / 2.0f;
+            tree.best_left_label = left_label;
+            tree.best_right_label = right_label;
+            tree.best_left_score = tree.current_element_count - left_classification_score;
+            tree.best_right_score = (tree.size - tree.current_element_count) - right_classification_score;
+        } else {
+            tree.can_skip = tree.score_to_beat - (left_classification_score + right_classification_score);
+        }
+
+        int remaining_size = tree.size - tree.current_element_count;
+        tree.is_zero |= (right_classification_score == remaining_size) || (tree.can_skip >= remaining_size);
+
+        if (left_tree.is_zero && right_tree.is_zero) {
+            break;
+        }
+
+        if (left_tree.can_skip >= left_tree.size - left_tree.current_element_count && right_tree.can_skip >= right_tree.size - right_tree.current_element_count) {
+            break;
+        }
+
+        tree.current_element_count++;
+        tree.current_label_frequency[current_feature_data.label]++;
+        tree.previous_value = current_feature_data.value;
+        tree.previous_unique_value_index = current_feature_data.unique_value_index;
+    }
+}
